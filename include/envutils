@@ -1,0 +1,35 @@
+# Copyright (c) 2000-2015 Synology Inc. All rights reserved.
+
+
+# $1 = version, $2 = arch
+SetBuildEnvPre() {
+	if [ $# -gt 2 ]; then
+		echo "Wrong number of parameters to SetBuildEnvPre()"
+		return 1
+	elif [ "$1" = "unknown" ]; then
+		echo "Unknown version is given to SetBuildEnvPre()"
+		return 1
+	fi
+	local version="$1" arch="$2"
+
+	case "$arch" in
+		"ppc") arch="powerpc" ;;
+		"824x" | "853x" | "854x") arch="ppc$arch" ;;
+		"6180" | "6281") arch="88f$arch" ;;
+		"816x") arch="ti$arch" ;;
+		*) arch="$arch" ;;
+	esac
+	if [ -f "include/env.config-$version" ]; then
+		ln -sf env.config-$version include/env.config
+	else
+		echo "Platform or environment config for $arch($version) does not exist!"
+		return 1
+	fi
+	return 0
+}
+
+UpdatePkgScripts() {
+	echo "UpdatePkgScripts() is empty for customization."
+}
+
+# vim:ft=sh

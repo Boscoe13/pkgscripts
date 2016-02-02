@@ -1,0 +1,358 @@
+#!/bin/bash
+# Copyright (c) 2000-2015 Synology Inc. All rights reserved.
+
+
+# Print error message $2 and exit with code $1
+CheckErrorOut() {
+	[ $# -ne 2 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	[ "$1" = "0" ] && return
+	local regexp_digit='^[0-9]+$'
+	[[ $1 =~ $regexp_digit ]] || CheckErrorOut 1 "Invalid parameter to $FUNCNAME()."
+	echo -e "Error: $2"
+	exit $1
+}
+
+CheckRootAccess() {
+	# Only root can run this
+	if ! id | grep "uid=0" > /dev/null; then
+		CheckErrorOut 1 "This script must be run as root!"
+	fi
+}
+
+CheckPermission() {
+	CheckRootAccess
+	# Stop if /root/.chroot does not exit
+	if [ ! -f /root/.chroot ]; then
+		CheckErrorOut 1 "Please chroot first!"
+	fi
+}
+
+# $1: config file, $2 milestone
+CheckMileStone()
+{
+	[ $# -ne 2 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	[ -f "$1" ] || { echo "Config '$1' not exist!"; return 1; }
+	[ -n "$2" ] || { echo "Please specify section name!"; return 1; }
+	grep -q "^\[$2\]" $1 && return 0
+	echo "Section '$2' not found in '$1'!"
+	return 1
+}
+
+# $1: target to find, else: list to search
+CheckInList() {
+	[ $# -lt 1 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	local target="$1" proj=
+	shift
+	for proj in $@; do
+		[ $proj = $target ] && return 0
+	done
+	return 1
+}
+
+CheckAptSupport() {
+	if ! type apt-get >& /dev/null; then
+		return 1
+	else
+		# FIXME clean before update, avoid update failed
+		apt-get clean
+		rm -rf /var/lib/apt/lists
+		mkdir -p /var/lib/apt/lists/partial
+		apt-get update && return 0 || return 1
+	fi
+}
+
+CheckDpkgSupport() {
+	if ! type dpkg >& /dev/null; then
+		return 1
+	else
+		return 0
+	fi
+}
+
+# Check if a Project is able to be parallelized by make -j
+# Parameter $1: Prjoect name
+# Return: 0 if ok, 1 if no
+ProjectParallelizable() {
+	local checkproj
+	for checkproj in ${SeqProjs}; do
+		[ "$checkproj" = "$1" ] && return 1
+	done
+	return 0
+}
+
+Interface2Ip() {
+	local ip=
+	[ -z "$1" ] && return 0
+	ip=`ifconfig $1 2> /dev/null | grep "inet addr:" | cut -d":" -f 2 | cut -d " " -f 1`
+	[ -z "$ip" ] && ip=`ifconfig $1 2> /dev/null | grep "inet " | awk '{print $2}'`
+	echo $ip
+}
+
+GetLocalIP() {
+	local ip=
+
+	for interface in eth0 eth1 net0 bond0 em1; do
+		ip=`Interface2Ip $interface`
+		[ "$ip" ] && break
+	done
+
+	echo $ip
+	return 0
+}
+
+BuildMachineOnly() {
+	local ip=`GetLocalIP`
+	local machine=
+
+	for machine in $BuildMachineList; do
+		[ "$machine" = "$ip" ] && return 0
+	done
+	echo "This IP ($ip) is not build machine."
+	return 1
+}
+
+# Import /env.mak.template in bash in a safer way than simply source it
+ImportEnvMak() {
+	local line= key= value=
+	while read line; do
+		key="${line%%=*}"
+		value="`echo ${line#*=} | sed 's/\"//g'`"
+		eval $key="\$value"
+	done < ${1:-/env.mak}
+}
+
+ResolveEnvVersion() {
+	[ $# -ne 1 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	local regexp_version='^[0-9]+\.[0-9]+-[0-9]+$'
+	[[ "$1" =~ $regexp_version ]] || CheckErrorOut 1 "$1 is not a valid version! It should be something like '4.0-2198'."
+	EnvMajor="`echo $1 | cut -d'.' -f1`"
+	EnvMinor="`echo $1 | cut -d'-' -f1 | cut -d'.' -f2`"
+	EnvVersion="`echo $1 | cut -d'-' -f2`"
+}
+
+ResolvePkgVersion() {
+	[ $# -ne 1 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	local regexp_version='^[0-9][0-9A-Za-z\.\-]*(-[0-9]+)?$'
+	[[ "$1" =~ $regexp_version ]] || CheckErrorOut 1 "$1 is not a valid package version!"
+	PkgVersion="`echo $1 | awk -F- '{print $NF}'`"
+}
+
+# This is used by EnvDeploy for convenience.
+ResolveBuildNumber() {
+	CheckErrorOut 1 "Sorry, mapping from build number to DSM version is not supported anymore."
+}
+
+CheckProjectStatus() {
+	local chk_type="$1"
+	ThisResult="$LogDir/$2.$1"
+	if [ ! -r "$ThisResult" ]; then
+		return 1
+	fi
+	ThisStatus=`sed '/tar\ zcpvf\ .../,/\[Done\]/d' "$ThisResult" | grep -E "line.*syntax error|Error" | grep -v 'checking for GPG Error - version' | grep -v 'this file was generated for autoconf 2.60' | grep -v ignored | grep -v Errors.py | grep -v CdsErrors  | grep -v distclean | grep -v PQresultErrorField | grep -v PQsetErrorVerbosity | grep -v hp2ps-Error | grep -v "Error Reporting support" | grep -v "Xapian::ErrorHandler" | grep -v SYNOErrorDump | grep -v GetErrorMsg | grep -v DelErrnoText | grep -v ErrorText | grep -v MVCPPrintError | grep -v ShowZError | grep -v ataPrintSmartErrorlog | grep -v SetMkdirError | grep -v SetRenameError | grep -v OutputError | grep -Ev 'Error\.(c|h|o|cpp|lo|pm|3|js|gif)' | grep -Ev '(glu|res|\.deps/|X[a-zA-Z]*)Error' | grep -v ErrorCode | grep -v TIFFSetErrorHandlerExt | grep -v SplashError | grep -v pkix_VerifyNode_FindError | grep -v PKIX_Error_Create | grep -v pkix_Error2ASCII | grep -v glib-Error-Reporting.html | grep -v savedError | grep -v ErrFHOSTGetMkfsError | grep -v "ImportError" | grep -v GenError | grep -v "tstLastError.py" | grep -v "libxml_xmlTextReaderGetErrorHandler" | grep -v "libxml_xmlParserCtxtGetErrorHandler" | grep -v "libxml_xmlErrorPtrWrap" | grep -v "ErrorFunc" | grep -v "\/Error" | grep -v "Error\/" |grep -v "Error::Simple" |grep -v "Writing Makefile for Error" | grep -v "SetValidErrors" | grep -Ev "skip client functions" | grep -v "struct cli_credentials" | grep -v "eglGetError" | grep -v "MCErrorMessage"`
+	if [ -z "$ThisStatus" ]; then
+		ThisStatus=`grep -is "fatal error" $ThisResult` | `grep -v 'configure: Automatically print stack trace on fatal errors: no'`
+	fi
+	if [ -z "$ThisStatus" ]; then
+		ThisStatus=`grep -is "*** missing separator (did you mean TAB instead of 8 spaces?)." $ThisResult`
+	fi            
+	if [ -z "$ThisStatus" ]; then
+		ThisStatus=`grep -is "No rule to make target" $ThisResult | grep -v distclean | grep -v clean`
+	fi
+	if [ -z "$ThisStatus" ]; then
+		ThisStatus=`grep -is "don't know" $ThisResult | grep -v "make distclean" | grep -v "make clean"`
+	fi
+	if [ -z "$ThisStatus" ]; then
+		ThisStatus=`grep -is "error:" $ThisResult | grep -v "make distclean" | grep -v "make clean" | grep -v "echo: write error: Broken pipe" | grep -v "error: Autoconf version 2.63 or higher is required" | grep -v "ImportError" | grep -v "skip client functions" | grep -v "struct cli_credentials" | grep -v "cut: write error: Broken pipe"`
+	fi
+	if [ "$chk_type" = "install" -a -z "$ThisStatus" ]; then
+		ThisStatus=`grep -is "No such file or directory" $ThisResult | grep -v "ImportError" `
+	fi
+
+	if [ "$ThisStatus" != "" ]; then
+		return 2
+	else
+		return 0
+	fi
+}
+
+# Usage: ErrorCheck LogSuffix
+CheckErrorLog() {
+	ErrorLog="${LogDir}/error.$1"
+	[ -r "$ErrorLog" ] && mv -f $ErrorLog ${ErrorLog}.old
+	local proj_count=0
+	local err_count=0
+	local warn_count=0
+	local ret=
+	for ThisProj in $ProjectList; do
+		CheckProjectStatus $1 $ThisProj
+		ret=$?
+		if [ $ret -eq 1 ]; then
+			echo "Result file $ThisResult doesn't exist or isn't readable." 2>&1 | tee -a $ErrorLog
+			echo "Cannot check any information about compiling error(s)."
+			echo ""
+			Errors="Y"
+		else
+			if [ $ret -ne 0 ]; then
+				echo "I got the following error:" >> $ThisResult
+				echo "$ThisStatus" >> $ThisResult
+				echo "########################################################"
+				echo "      Error(s) occurred on project \"$ThisProj\"" 2>&1 | tee -a $ErrorLog
+				echo "########################################################"
+				Errors="Y"
+				err_count=$(( $err_count + 1 ))
+			fi
+			if [ "$1" = "build" ]; then
+				WarnCount=`grep -s "warning:" $ThisResult | wc -l`
+				if [ 0 -ne $WarnCount ]; then
+					printf "%-30s:\t%4d warning(s)\n" $ThisProj $WarnCount
+					Warns="Y"
+					warn_count=$(( $warn_count + 1 ))
+				fi
+			fi
+		fi
+		proj_count=$(( $proj_count + 1 ))
+	done
+	echo -n "$proj_count projects, $err_count failed"
+	if [ "$1" = "build" ]; then
+		echo ", $warn_count have warnings."
+	else
+		echo "."
+	fi
+	echo ""
+}
+
+# Check build platform and set the corresponding variables:
+# PLATFORM_ABBR, BUILD_TARGET, BUILD_OPT
+# Usage: AskPlatfrom $@
+AskPlatform() {
+	local INDEX="" i=1 abbr target kernel comment others
+	declare -a AbbrArray TargetArray
+
+	# Init array & hash table
+	line=`echo "$AllPlatforms"| wc -l`
+	for (( i=1; i <= line; i++ )); do
+		abbr=`echo "$AllPlatforms" | awk '(NR=='$i'){print $1}'`
+		target=`echo "$AllPlatforms" | awk '(NR=='$i'){print $2}'`
+		declare AbbrHash_$abbr=$i
+		declare TargetHash_$target=$i
+		AbbrArray[$i]=$abbr
+		TargetArray[$i]=$target
+	done
+
+	if [ $# -gt 0 ]; then
+		for ThisArg in $@; do
+			# Remember platform choice
+			INDEX=AbbrHash_${ThisArg#--*}
+			if [ -n "${!INDEX}" ]; then
+				PLATFORM_ABBR=${ThisArg#--*}
+				BUILD_TARGET=${TargetArray[${!INDEX}]}
+				BUILD_OPT="--${PLATFORM_ABBR}"
+			fi
+		done
+	fi
+	if [ -z "${!INDEX}" -a -f /env.mak.template ]; then
+		# Auto detect the platform in env.mak.template
+		declare `grep ^SYNO_PLATFORM= /env.mak.template`
+		INDEX=TargetHash_${SYNO_PLATFORM}
+		if [ -n "${!INDEX}" ]; then
+			PLATFORM_ABBR="${AbbrArray[${!INDEX}]}"
+			BUILD_TARGET=$SYNO_PLATFORM
+			BUILD_OPT="--${PLATFORM_ABBR}"
+		else
+			echo "Failed to detect platform ($SYNO_PLATFORM) in env.mak.template"
+		fi
+		# Since alpine and alpine4k share the same SYNO_PLATFORM, the above detection
+		# falls back to the latest ALPINE entry (alpine4k), we have to use another way
+		# to distinguish them
+		if [ "${BUILD_TARGET}" = "ALPINE" ]; then
+			local platform="alpine"
+			cat /root/.bashrc | grep "PS1" | grep "alpine4k" > /dev/null
+			if [ $? -eq 0 ]; then
+				platform="alpine4k"
+			fi
+			cat /root/.bashrc | grep "PS1" | grep "alpine310" > /dev/null
+			if [ $? -eq 0 ]; then
+				platform="alpine310"
+			fi
+			PLATFORM_ABBR="${platform}"
+			BUILD_OPT="--${platform}"
+		fi
+	fi
+
+	# Ask platform interactively if not specified in argument
+	if [ -z "$BUILD_TARGET" ]; then
+		echo "Please choose target platform:"
+		i=0
+		echo "$AllPlatforms" | while read abbr target kernel comment; do
+			printf "\t%4s %-30s%-20s%-20s\n" \
+			"[$((i+=1))]" "$comment" "($kernel)" "{--$abbr}"
+		done
+		echo -en "Enter a number: "
+		read Reply;
+		if [ -z "${AbbrArray[$Reply]}" ]; then
+			echo "Unknow platform. EXIT!!"
+			exit 1
+		fi
+		PLATFORM_ABBR="${AbbrArray[${Reply}]}"
+		BUILD_TARGET=${TargetArray[$Reply]}
+		BUILD_OPT="--${PLATFORM_ABBR}"
+	fi
+}
+
+ShowTimeCost() {
+	TAG_INTERNAL=""
+        
+	if [ -n "$3" ]; then
+		TAG_INTERNAL="[$3]"
+	fi
+
+	D_INT0=$1
+	D_INT1=$2
+
+	DIFF_INT=$((${D_INT1}-${D_INT0}))
+	DIFF_SEC=$((${DIFF_INT}%60))
+	DIFF_MIN=$(((${DIFF_INT}/60)%60))
+	DIFF_HOUR=$(((${DIFF_INT}/3600)%60))
+	
+	printf "Time cost: %02d:%02d:%02d %s\n" ${DIFF_HOUR} ${DIFF_MIN} ${DIFF_SEC}    ${TAG_INTERNAL}
+}
+
+CheckTimeCostLog() {
+	echo ""
+	echo "----------------- Time cost statistics -----------------"
+	for ThisProj in $ProjectList; do
+		ThisResult="${LogDir}/${ThisProj}.$1"
+		if [ -r "$ThisResult" ]; then
+			ThisStatus="`grep "Time cost:" $ThisResult`"
+			echo "$ThisStatus"
+		fi
+	done
+	echo ""
+}
+
+GetRealProjectName() {
+	[ $# -ne 1 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	[ "${1:0:1}" = "^" ] && echo $1 || echo $1 | cut -d'^' -f1
+}
+
+ResolveMinSdkMacro() {
+	[ $# -ne 1 ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	[[ $1 =~ ^[0-9]+\.[0-9]+$ ]] || CheckErrorOut 1 "Invalid SDK version \"$1\""
+	local major="`echo $1 | cut -d'.' -f1`"
+	local minor="`echo $1 | cut -d'.' -f2`"
+	echo "SDK_VER_MIN_REQUIRED=$((${major}*100+${minor}))"
+}
+
+# Check whether $1 smaller than $2
+SmallerThan() {
+	[ -z "$1" -o -z "$2" ] && CheckErrorOut 1 "Wrong number of parameters to $FUNCNAME()."
+	local ret="`echo "$1 $2" | awk '{if ($1 < $2) print "0"; else print "1"}'`"
+	return $ret
+}
+
+
+
+[ "$(caller)" != "0 NULL" ] && return 0
+`$@`
+
+# vim:ft=sh

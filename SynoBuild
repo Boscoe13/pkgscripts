@@ -1,0 +1,464 @@
+#!/bin/bash
+# Copyright (c) 2000-2015 Synology Inc. All rights reserved.
+
+
+LANG=""
+LC_ALL=""
+CurDir="`pwd`"
+ScriptsDir="$(dirname `readlink -f "$0"`)"
+
+Usage() {
+	cat << EOF
+
+Usage
+	`basename $0` [OPTIONS] project_name+
+
+Synopsis
+	Build projects.
+
+Options
+	-p, --platform {platform}
+		Specify target platform.
+	-c, --clean, --dontask
+		Cleanup before building.
+	-C, --cleanonly
+		Cleanup only and exit.
+	-j, --jobs {num}
+		Specify how many jobs to build in parallel. Default is 4.
+	-J	Disable parallel build.
+	-S	Disable silent make.
+	-x {level}
+		Build all dependant projects. Can specify level of dependency.
+		Expand project dependency list, and build them in turn.
+		Cannot be used with -r and default value is 0.
+		For example, -x3 means to traverse dependency to 3rd level (itself as level 0)
+	-r {level}
+		Expand project dependency list reversely, then build all depending projects.
+	-d, --with-debug
+		Build with debugging definition.
+	-N, --noclean
+		Do not cleanup before building.
+	--no-builtin
+		Do not skip built-in projects.
+	--with-ccache {size}
+		Set size of ccache to reduce compiler activities. Default is $DefaultCCacheSize.
+	--with-clean-ccache
+		Build with a cleared ccache.
+	--min-sdk {version}
+		Specify minimum required SDK version (for example, 4.0).
+	-h, --help
+		This help message.
+
+EOF
+}
+
+FunSetupBuildEnv() {
+	PATH="$PATH:$ToolChainBin:/usr/syno/bin"
+	SYNO_XTRACFLAGS="$SYNO_XTRACFLAGS -D`ResolveMinSdkMacro ${MinSdkVersion:-$BaseSdkVersion}`"
+	CFLAGS="$CFLAGS $SYNO_XTRACFLAGS"
+	STATIC_CFLAGS="$STATIC_CFLAGS $SYNO_XTRACFLAGS"
+	if [ "$SYNO_DEMO_MODE" = "Yes" ]; then
+		CheckInList DSYNO_DEMO_FIRMWARE $CFLAGS || CFLAGS="$CFLAGS -DSYNO_DEMO_FIRMWARE"
+		CheckInList DSYNO_DEMO_FIRMWARE $STATIC_CFLAGS || STATIC_CFLAGS="$STATIC_CFLAGS -DSYNO_DEMO_FIRMWARE"
+	fi
+
+	if [ "$BUILD_TARGET" = "MARVELL_ARMADA38X" ]; then
+		export LD_LIBRARY_PATH=/usr/lib64
+	fi
+
+	CCACHE_BIN="/usr/bin/ccache"
+	if [ ! -x "$CCACHE_BIN" ]; then
+		echo "Binary $CCACHE_BIN doesn't exist."
+		echo "Something wrong in this toolkit. Please contact maintainer."
+		exit 2
+	fi
+	export ICECC_CC=no
+	export CCACHE_DIR="/ccaches/$PLATFORM_ABBR"
+	export CCACHE_NOCOMPRESS=YES
+	export CCACHE_SLOPPINESS=file_macro,include_file_mtime,time_macros
+	mkdir -p $CCACHE_DIR
+	chmod 1777 $CCACHE_DIR
+	$CCACHE_BIN -M ${CCacheSize:-$DefaultCCacheSize}
+	$CCACHE_BIN -z
+	[ "$WithCleanCcache" = "Yes" ] && $CCACHE_BIN --clear
+
+	if CheckInList $SYNO_KERNEL_SOURCE_DIR $ProjectList; then
+		cp -f $SynobiosDir/include/synobios.h $KernelDir/include/linux/synobios.h
+	fi
+
+	# Generate /env.mak from template
+	local line= var=
+	rm -f /env.mak
+	while read line; do
+		var="`echo $line | cut -d'=' -f1`"
+		( [[ $line =~ =\" ]] && echo "$var=\"${!var}\"" || echo "$var=${!var}"; ) >> /env.mak
+	done < /env.mak.template
+
+	# Append missing toolchain tools
+	if [ -z "$READELF" ]; then
+		READELF=${ToolChainPrefix}readelf
+		echo "READELF=$READELF" >> /env.mak
+	fi
+}
+
+FunBuildInclude() {
+	local h= headers=
+	case "$BUILD_TARGET" in
+		# Kernel headers are built-in and not linked anymore
+		# Copy newly generated kernel headers to toolchain
+		"POWERPC")
+			headers="autoconf.h modversions.h version.h"
+			;;
+		"PPC_824X")
+			headers="autoconf.h compile.h utsrelease.h version.h"
+			;;
+		*)
+			# For other platforms, kernel headers are installed instead of using link
+			return
+			;;
+	esac
+	for h in $headers; do
+		cp -vf $KernelDir/include/linux/$h $ToolChainInclude/linux/$h
+		cp -vf $KernelDir/include/linux/$h $StaticInclude/linux/$h
+	done
+}
+
+FunBuildProject() {
+	if [ $# -ne 1 ]; then
+		echo "Error: Wrong number of parameters to $FUNCNAME().\n" 2>&1 | tee -a $LogFile
+		return 1
+	fi
+	local ThisProj="$1"
+	local Suffix=`expr match "$1" ".*\($VIRTUAL_PROJECT_SEPERATOR.*\)"`
+
+	# Set build script here!!
+	if [ -f "$SourceDir/$ThisProj/SynoBuildConf/build$Suffix" ]; then
+		BUILD_SCRIPT="$SourceDir/$ThisProj/SynoBuildConf/build$Suffix"
+	elif [ -f "$BuildScriptDir/$ThisProj" ]; then
+		BUILD_SCRIPT="$BuildScriptDir/$ThisProj"
+	else
+		echo -e "\nError: There is no build scripts for $ThisProj.\n" 2>&1 | tee -a $LogFile
+		return 1
+	fi
+
+	if ! cd $SourceDir/$ThisProj; then
+		echo -e "\nError: Project $ThisProj doesn't exist.\n" 2>&1 | tee -a $LogFile
+		return 1
+	fi
+
+	MAKE_FLAGS=""
+	[ "$MakeSilent" = "Yes" ] && MAKE_FLAGS="$MAKE_FLAGS -s -w"
+	if [ "$MakeJobs" = "Yes" ]; then
+		# Check if we can build this project in parallel
+		if ProjectParallelizable $ThisProj; then
+			MAKE_FLAGS="$MAKE_FLAGS -j $JOBS"
+			# Keep completely quite if (MakeSilent && MakeJobs)
+			[ "$MakeSilent" = "Yes" ] && MAKE_FLAGS="$MAKE_FLAGS --no-print-directory"
+		fi
+	fi
+
+	echo -e "\n======= Run build script =======\n" | tee -a $LogFile
+
+	if [ $ThisProj = "$uClibc" ]; then
+		if [ "$BuildLib" = "Y" ]; then
+			. $BUILD_SCRIPT 2>&1 | tee -a $LogFile
+		fi
+	else
+		. $BUILD_SCRIPT 2>&1 | tee -a $LogFile
+		if [ $ThisProj = "e2fsprogs-1.42" -o $ThisProj = "parted" ]; then
+			ThisStatus=`grep -s "Error" $LogFile | grep -v 'checking for GPG Error - version' | grep -v 'this file was generated for autoconf 2.60' | grep -v ignored | grep -v Errors.py | grep -v CdsErrors  | grep -v distclean | grep -v PQresultErrorField | grep -v PQsetErrorVerbosity | grep -v hp2ps-Error | grep -v "Error Reporting support" | grep -v "Xapian::ErrorHandler" | grep -v SYNOErrorDump | grep -v GetErrorMsg | grep -v DelErrnoText | grep -v ErrorText | grep -v MVCPPrintError | grep -v ShowZError | grep -v ataPrintSmartErrorlog | grep -v SetMkdirError | grep -v SetRenameError | grep -v OutputError | grep -Ev 'Error\.(c|h|o|cpp|lo|pm|3|js)' | grep -Ev '(glu|res|\.deps/|X[a-zA-Z]*)Error' | grep -v ErrorCode | grep -v TIFFSetErrorHandlerExt`
+			if [ "$ThisStatus" != "" ]; then
+				retryCount=0
+				while [ $retryCount -le 5 ]
+				do
+					rm -rf $LogFile
+					. $BUILD_SCRIPT 2>&1 | tee -a $LogFile
+					ThisStatus=`grep -s "Error" $LogFile | grep -v 'checking for GPG Error - version' | grep -v 'this file was generated for autoconf 2.60' | grep -v ignored | grep -v Errors.py | grep -v CdsErrors  | grep -v distclean | grep -v PQresultErrorField | grep -v PQsetErrorVerbosity | grep -v hp2ps-Error | grep -v "Error Reporting support" | grep -v "Xapian::ErrorHandler" | grep -v SYNOErrorDump | grep -v GetErrorMsg | grep -v DelErrnoText | grep -v ErrorText | grep -v MVCPPrintError | grep -v ShowZError | grep -v ataPrintSmartErrorlog | grep -v SetMkdirError | grep -v SetRenameError | grep -v OutputError | grep -Ev 'Error\.(c|h|o|cpp|lo|pm|3|js)' | grep -Ev '(glu|res|\.deps/|X[a-zA-Z]*)Error' | grep -v ErrorCode | grep -v TIFFSetErrorHandlerExt`
+					if [ "$ThisStatus" = "" ]; then
+						break
+					fi
+					retryCount=`expr $retryCount + 1`
+				done
+			fi
+		fi
+	fi
+}
+
+FunInstallProject() {
+	if [ $# -ne 1 ]; then
+		echo "Error: Wrong number of parameters to $FUNCNAME().\n" 2>&1 | tee -a $LogFile
+		return 1
+	fi
+	local ThisProj="$1" DebFileName=
+	local Suffix=`expr match "$1" ".*\($VIRTUAL_PROJECT_SEPERATOR.*\)"`
+
+	# Set install-dev script here!!
+	if [ -f "$SourceDir/$ThisProj/SynoBuildConf/install-dev$Suffix" ]; then
+		INSTALL_SCRIPT="$SourceDir/$ThisProj/SynoBuildConf/install-dev$Suffix"
+	elif [ -f "$InstallDevScriptDir/$ThisProj" ]; then
+		INSTALL_SCRIPT="$InstallDevScriptDir/$ThisProj"
+	else
+		echo -e "\nThere is no install-dev scripts for $ThisProj.\n" 2>&1 | tee -a $LogFile
+		return 0
+	fi
+
+	rm -rf $DebDevDir/*
+	echo -e "\n======= Run install-dev script =======\n" | tee -a $LogFile
+	. $INSTALL_SCRIPT 2>&1 | tee -a $LogFile
+	if [ "$SupportDpkg" = "Yes" -a -x "$ScriptsDir/SynoDeb" ]; then
+		rm -f $DebDevDir/$SynoLibDir/*.la
+		DebFileName="${DebName}_${DebVersion:-$DummyDebVersion}_all.deb"
+		rm -f $DebPkgDir/${DebName}_*_all.deb
+		echo -e "Create $DebFileName" | tee -a $LogFile
+		$ScriptsDir/SynoDeb --create $DebFileName $DebDevDir $DebPkgDir 2>&1 | tee -a $LogFile
+		if [ -s "$DebPkgDir/$DebFileName" ]; then
+			echo -e "Unpack $DebFileName"  2>&1 | tee -a $LogFile
+			dpkg -i --force-overwrite $DebPkgDir/$DebFileName 2>&1 | tee -a $LogFile
+			if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+				echo -e "Error: dpkg -i --force-overwrite $DebPkgDir/$DebFileName failed !" | tee -a $LogFile
+			fi
+		fi
+	fi
+}
+
+
+Args=`getopt -u -l \
+'platform:,clean,noclean,cleanonly,dontask,jobs:,with-ccache:,with-clean-ccache,with-debug,\
+min-sdk:,no-builtin,help' \
+cCNdhx:r:p:j:JS $@`
+if [ $? -ne 0 ]; then
+	echo "You gave me option(s) that I do not know."
+	Usage
+	exit 1
+fi
+set -- $Args
+if [ -z "$1" ]; then
+	Usage
+	exit 1
+fi
+
+uClibc="uclibc0929"
+MakeSilent="Yes"
+MakeJobs="Yes"
+WithCleanCcache="No"
+IgnoreBuiltin="Yes"
+DefaultCCacheSize="1G"
+REG_DIGIT='^[0-9]+$'
+BUILD_DEP_LEVEL=""
+DEP_OPT=""
+SYNO_XTRACFLAGS="-g"
+
+. $ScriptsDir/include/toolkit.config
+. $ScriptsDir/include/env.config
+. $ScriptsDir/include/check
+[ -f "$ScriptsDir/include/apparmor" ] && . $ScriptsDir/include/apparmor
+if [ -f "$ScriptsDir/include/gitutils" ]; then
+	. $ScriptsDir/include/gitutils
+fi
+CheckPermission
+ImportEnvMak /env.mak.template
+export SYNO_PLATFORM="$SYNO_PLATFORM"
+export DSM_BUILD_NUM DSM_SHLIB_MAJOR DSM_SHLIB_MINOR
+export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/syno/lib/pkgconfig"
+
+if [ -n "$BRINGUP_VERSION" ]; then
+	BRINGUP_MAJOR=$(echo $BRINGUP_VERSION | cut -d. -f1)
+	BRINGUP_MINOR=$(echo $BRINGUP_VERSION | cut -d. -f2)
+	if [ -n "$BRINGUP_MAJOR" -a -n "$BRINGUP_MINOR" -a "$BRINGUP_MAJOR" = "$DSM_SHLIB_MAJOR" ]; then
+		BaseSdkVersion="$BRINGUP_VERSION"
+	fi
+fi
+
+if [ -z "$BaseSdkVersion" ]; then
+	BaseSdkVersion="$DSM_SHLIB_MAJOR.0"
+fi
+DummyDebVersion="$DSM_SHLIB_MAJOR.$DSM_SHLIB_MINOR-$DSM_BUILD_NUM"
+
+
+# Parse options
+while [ -n "$1" ]; do
+case "$1" in
+	"-p" | "--platform")
+		AskPlatform "--$2"
+		shift
+		;;
+	"-C" | "--cleanonly")
+		MakeClean="Yes"
+		CleanOnly="Yes"
+		;;
+	"-c" | "--clean" | "--dontask")
+		MakeClean="Yes"
+		;;
+	"-N" | "--noclean")
+		MakeClean="No"
+		;;
+	"-d" | "--with-debug")
+		SYNO_XTRACFLAGS="$SYNO_XTRACFLAGS -DSYNO_DEBUG_BUILD"
+		;;
+	"--no-builtin")
+		IgnoreBuiltin="No"
+		;;
+	"-h" | "--help")
+		Usage
+		exit 0
+		;;
+	"-J")
+		MakeJobs="No"
+		;;
+	"-j" | "--jobs")
+		JOBS="$2"
+		if [[ "$JOBS" =~ $REG_DIGIT ]] && [ "$JOBS" -gt 1 ]; then
+			MakeJobs="Yes"
+		else
+			MakeJobs="No"
+		fi
+		shift
+		;;
+	"-S")
+		MakeSilent="No"
+		;;
+	"--with-ccache")
+		if [[ "$2" =~ ^[0-9]+(\.[0-9]+)?[KMG]?$ ]]; then
+			CCacheSize="$2"
+			shift
+		fi
+		;;
+	"--with-clean-ccache")
+		WithCleanCcache="Yes"
+		;;
+	"-x" | "-r")
+		DEP_OPT="$1"
+		if [[ "$2" =~ $REG_DIGIT ]] ; then
+			BUILD_DEP_LEVEL="$2"
+			shift
+		else
+			BUILD_DEP_LEVEL="0"
+		fi
+		;;
+	"--min-sdk")
+		MinSdkVersion="$2"
+		shift
+		;;
+	"--")
+		# Remaining are project names
+		shift
+		break
+		;;
+	*)
+		echo "Unhandled option '$1'"
+		echo "Something wrong in $0. Please contact maintainer."
+		exit 1
+		;;
+esac
+shift
+done
+
+# Call again without parameters to prompt user interactively
+[ -z "$BUILD_TARGET" ] && AskPlatform
+if [ "$BUILD_TARGET" != "POWERPC" ]; then  # POWERPC uses the one in include/toolkit.config
+	KernelDir="$SOURCE_DIR/$SYNO_KERNEL_SOURCE_DIR"
+fi
+
+# Ask user whether make clean or not if not specified
+if [ -z "$MakeClean" ]; then
+	read -p "Do you want to make disclean before compile?(Y/N) [Y]: " MakeClean
+	[ "$MakeClean" != "N" -a "$MakeClean" != "n" ] && MakeClean="Yes"
+fi
+
+# Auto detect CPU count
+if [ "$MakeJobs" = "Yes" -a -z "$JOBS" ]; then
+	JOBS=`grep ^processor /proc/cpuinfo | wc -l` 
+	[ $JOBS -lt 2 ] && JOBS=2
+fi
+
+# Resolve projects to build
+for ThisProj in $@; do
+	ProjectList="$ProjectList `basename $ThisProj`"
+done
+ProjectList="`echo $ProjectList | sed 's/ /\n/g' | sort | uniq`"
+if [ -z "$ProjectList" ]; then
+	CheckErrorOut 2 "You have to specify at least one poject name!"
+fi
+
+# Traverse dependency
+cd $ScriptsDir
+if ! ProjectList=$(./ProjDepends.py $DEP_OPT $BUILD_DEP_LEVEL -p "$PLATFORM_ABBR" $ProjectList); then
+	CheckErrorOut 1 "Failed to get dependency list!"
+fi
+if [ -z "$ProjectList" ]; then
+	CheckErrorOut 0 "No Project actually needed to be built."
+fi
+if echo "$ProjectList" | grep -q "$uClibc"; then
+	BuildLib="Y"
+fi
+echo ProjectList=\"$ProjectList\"
+
+# Resolve built-in projects
+ExcludeListFile="/seen_curr.list"
+if [ "$IgnoreBuiltin" = "Yes" -a -f "$ExcludeListFile" ]; then
+	ForceBuildProjects="`cat $ExcludeListFile | sed 's/ /|/g'`"
+	BuiltinProjects="`echo "$BuiltinProjects" | sed 's/ /\n/g' | grep -vE "$ForceBuildProjects"`"
+fi
+echo BuiltinProjects=\"$BuiltinProjects\"
+
+# Setup build environment
+FunSetupBuildEnv
+
+# Resolve APT and DPKG settings
+DebType="dev"
+SupportApt="No"
+CheckDpkgSupport && SupportDpkg="Yes" || SupportDpkg="No"
+[ -d "$DebDevDir" ] || mkdir -p $DebDevDir
+[ -d "$DebPkgDir" ] || mkdir -p $DebPkgDir
+
+mkdir -p $LogDir
+for Proj in $ProjectList; do
+	Date0=`date +%s`
+	DebName="${Proj}-${PLATFORM_ABBR}-${DebType}"
+	DebVersion=`grep "^$Proj=" $ScriptsDir/include/version_map 2> /dev/null | awk -F \" '{print $2}'`
+	LogFile="$LogDir/$Proj.build"
+	[ -f "$LogFile" ] && mv -f $LogFile $LogFile.old
+
+	# Skip built-in projects
+	if [ "$IgnoreBuiltin" = "Yes" ] && CheckInList $Proj $BuiltinProjects; then
+		echo -e "$Proj is built-in project. Skip it.\n" 2>&1 | tee -a $LogFile
+		Date1=`date +%s`
+		ShowTimeCost $Date0 $Date1 "Build-->$Proj" 2>&1 | tee -a $LogFile
+		continue
+	fi
+
+	grep -q $Proj /BuildList 2> /dev/null && InBuildList="Yes"
+	# Projects with APT support
+	if [ "$SupportApt" = "No" -o -z "$DebVersion" -o "$InBuildList" = "Yes" ]; then
+		NeedToBuild="Yes"
+	else
+		# apt-get only when creating environment thus no need to traverse reverse dependency latter
+		# avoid lib project link previous installed lib
+		# ex: sdk tool links dpkg's libsynosdk.so
+		if dpkg -l | grep -qiw " $DebPkg"; then
+			dpkg -r "$DebPkg" 2>&1| tee -a $LogFile
+		fi
+
+		NeedToBuild="Yes"
+	fi
+
+	if [ $NeedToBuild = "Yes" ]; then
+		FunBuildProject $Proj
+		FunInstallProject $Proj
+		[ $Proj = "linux-2.6.24" -o $Proj = "uclinux2422" ] && FunBuildInclude
+	fi
+	Date1=`date +%s`
+	ShowTimeCost $Date0 $Date1 "Build-->$Proj" 2>&1 | tee -a $LogFile
+done
+
+cd $CurDir
+Errors="N"
+Warns="N"
+CheckTimeCostLog build
+CheckErrorLog build
+if [ "$Errors" = "N" ]; then
+	exit 0
+else
+	echo "Check [$ErrorLog] for fixing errors."
+	exit 1
+fi

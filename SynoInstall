@@ -1,0 +1,197 @@
+#!/bin/bash
+# Copyright (c) 2000-2015 Synology Inc. All rights reserved.
+
+
+LANG=""
+LC_ALL=""
+CurDir="`pwd`"
+ScriptsDir="$(dirname `readlink -f "$0"`)"
+
+
+Usage() {
+	cat << EOF
+
+Usage
+	`basename $0` [OPTIONS] project_name+
+
+Synopsis
+	Install projects.
+
+Options
+	-p, --platform {platform}
+		Specify target platform.
+	-d, --with-debug
+		Install binaries with debug symbols.
+	-h, --help
+		This help message.
+	-j, --junior
+		Install junior version.
+	-s, --suffix {suffix}
+		Install with suffix. Valid suffix specifiers are
+		wins: for web install
+
+EOF
+}
+
+
+Args=`getopt -u -l 'platform:,with-debug,single,help' p:dh $@`
+if [ $? -ne 0 ]; then
+	echo "You gave me option(s) that I do not know."
+	Usage
+	exit 1
+fi
+set -- $Args
+if [ -z "$1" ]; then
+	Usage
+	exit 1
+fi
+
+. $ScriptsDir/include/toolkit.config
+. $ScriptsDir/include/env.config
+. $ScriptsDir/include/check
+[ -f "$ScriptsDir/include/apparmor" ] && . $ScriptsDir/include/apparmor
+[ -f "$ScriptsDir/include/install" ] && . $ScriptsDir/include/install
+CheckPermission
+ImportEnvMak
+
+SDSCustomDir="$SourceDir/sds_custom"
+SIITool="$SourceDir/sds_sii/siitool"
+export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/syno/lib/pkgconfig"
+
+
+# Parse options
+while [ -n "$1" ]; do
+case "$1" in
+	"-p" | "--platform")
+		AskPlatform "--$2"
+		shift
+		;;
+	"-d" | "--with-debug")
+		export NOSTRIP="NOSTRIP"
+		IsDebugBuild="Y"
+		;;
+	"-h" | "--help")
+		Usage
+		exit 0
+		;;
+	"--single")
+		# For compatibility only. Ignore this.
+		;;
+	"--")
+		# Remaining are project names
+		shift
+		break
+		;;
+	*)
+		echo "Unhandled option '$1'"
+		echo "Something wrong in $0. Please contact maintainer."
+		exit 1
+		;;
+esac
+shift
+done
+
+# Call again without parameters to prompt user interactively
+[ -z "$BUILD_TARGET" ] && AskPlatform
+
+if [ ${BUILD_TARGET} = "MARVELL_ARMADA38X" ]; then
+	export LD_LIBRARY_PATH=/usr/lib64
+fi
+
+# Create necessary directories
+if [ "$IsDebugBuild" = "Y" ]; then
+	TarBallDir=$DebugTarBallDir
+else
+	TarBallDir=$TarBallDir
+fi
+mkdir -p $TarBallDir $LogDir $TmpInstDir
+
+# Resolve projects to build
+for ThisProj in $@; do
+	ProjectList="$ProjectList `basename $ThisProj`"
+done
+ProjectList="`echo $ProjectList | sed 's/ /\n/g' | sort | uniq`"
+
+# Resolve APT settings
+IsBuildMachine="$?"
+[ "$IsDebugBuild" = "Y" ] && DebType="debug" || DebType="bin"
+SupportApt="Y"
+
+for ThisProj in $ProjectList; do
+	echo "======================================"
+	echo "Start to install $ThisProj"
+	echo "======================================"
+
+	LogFile="$LogDir/$ThisProj.install"
+	[ -f "$LogFile" ] && mv -f $LogFile $LogFile.old
+	rm -rf $TmpInstDir/*
+
+	# Check /$InstallListFile if exist
+	if [ -n "$InstallListFile" -a -f "/$InstallListFile" ]; then
+		if [ $(grep "^$ThisProj$" /$InstallListFile | wc -l) -eq 0 ]; then
+			NeedToInstall="N"  # No
+		else
+			NeedToInstall="Y"  # Yes
+		fi
+	else
+		NeedToInstall="U"  # Unknown
+	fi
+
+	# Check $BuildTimeAptList and try apt-get install
+	HitAptList=`echo $BuildTimeAptList | sed 's/ /\n/g' | grep "^$ThisProj$" | wc -l`
+	if [ $HitAptList -eq 0 -o $SupportApt = "N" -o "$ForceBuildAll" = "yes" ]; then
+		NeedToInstall="Y"
+	else
+		echo -e "\nAPT is not supported yet!!\n"
+		NeedToInstall="Y"
+	fi
+
+	if [ $NeedToInstall = "Y" ]; then
+
+		# Set install script here!!
+		Suffix=`expr match "$ThisProj" ".*\($VIRTUAL_PROJECT_SEPERATOR.*\)"`
+		if [ -f "$SourceDir/$ThisProj/SynoBuildConf/install$Suffix" ]; then
+			INSTALL_SCRIPT="$SourceDir/$ThisProj/SynoBuildConf/install$Suffix"
+		elif [ -f "$InstallScriptDir/$ThisProj" ]; then
+			INSTALL_SCRIPT="$InstallScriptDir/$ThisProj"
+		else
+			echo -e "\nError: There is no install scripts for $ThisProj.\n" 2>&1 | tee -a $LogFile
+			continue
+		fi
+
+		if ! cd $SourceDir/$ThisProj; then
+			echo -e "\nError: Project $ThisProj doesn't exist.\n" 2>&1 | tee -a $LogFile
+			continue
+		fi
+
+		. $INSTALL_SCRIPT 2>&1 | tee -a $LogFile
+
+		if [ "Y" = "$IsDebugBuild" -a -d "./abi_dumps" ]; then
+			mkdir -p $TmpInstDir/abi
+			for Tar in `find ./abi_dumps/ -name "*abi.tar.gz"`; do
+				cp -vf $Tar $TarBallDir
+				cp -vf $Tar $TmpInstDir/abi
+			done
+		fi
+
+		if [ $SupportApt = "Y" -a $HitAptList -gt 0 -a $IsBuildMachine -eq 0 ]; then
+			echo -e "\nPackage build machine does not have to create .deb!!\n"
+		fi
+	fi
+
+	if [ `ls $TmpInstDir | wc -w` -ne 0 ]; then
+		cd $TmpInstDir
+		echo "tar zcpvf ..." 2>&1 | tee -a $LogFile
+		tar zcpvf $TarBallDir/$ThisProj.tgz * 2>&1 | tee -a $LogFile
+		echo "[Done]" 2>&1 | tee -a $LogFile
+	fi
+	echo ""
+done
+
+cd $CurDir
+Errors="N"
+CheckErrorLog install
+echo -e "################################################################\n"
+[ "$Errors" = "N" ] && echo "Finished SynoInstall script." || echo "*** Error(s). Please see $ErrorLog."
+echo -e "\n################################################################\n"
+[ "$Errors" = "Y" ] && exit 1 || exit 0
